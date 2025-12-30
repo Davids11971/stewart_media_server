@@ -145,10 +145,10 @@ cd MediaServer
 ```
 
 ### 2) Configure environment
-This repo includes `sample.env`. Copy it to `.env` and edit:
+This repo includes `env.example`. Copy/rename it to `.env` and edit:
 
 ```bash
-cp sample.env .env
+cp env.example .env
 nano .env
 ```
 

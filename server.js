@@ -20,10 +20,10 @@ const app = express();
 const PORT = Number.parseInt(process.env.PORT || "4000", 10);
 
 // === CONFIG ===
-// On Raspberry Pi / Linux this is typically something like: /mnt/media1,/mnt/media2
+// On Raspberry Pi / Linux this is typically something like: /media/<user>/<driveLabel>
 // On Windows you might use something like: G:/ or D:/Media
 const DEFAULT_ROOT =
-  process.platform === "win32" ? "G:/" : "/mnt/media";
+  process.platform === "win32" ? "G:/" : "/media/davids11971/VAULT";
 
 const MEDIA_ROOTS_RAW =
   process.env.MEDIA_ROOTS ||

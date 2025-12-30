@@ -2,8 +2,7 @@
 node_modules/
 
 # local env files
-.env
-.env.*
+# (intentionally NOT ignored; this repo commits .env for easy deploy to the Pi)
 
 # runtime caches
 thumbcache/

@@ -5,6 +5,7 @@
 
 const express = require("express");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const sharp = require("sharp"); // npm install sharp
 const mime = require("mime");   // npm install mime
@@ -42,9 +43,7 @@ const VIDEO_CHUNK_SIZE = Number.parseInt(
   10
 );
 
-const THUMB_CACHE = path.resolve(
-  process.env.THUMB_CACHE_DIR || path.join(__dirname, "thumbcache")
-);
+// THUMB_CACHE is configured after MEDIA_ROOTS is computed (so we can default it under the VAULT root).
 
 const ALLOWED_EXTS = [
   ".mp4", ".mov", ".avi", ".mkv", 
@@ -99,6 +98,43 @@ const MEDIA_ROOTS = (() => {
     return { id, rootPath, abs };
   });
 })();
+
+function ensureWritableDir(preferredPath, fallbackPath) {
+  const prefer = path.resolve(preferredPath);
+  try {
+    if (!fs.existsSync(prefer)) fs.mkdirSync(prefer, { recursive: true });
+    fs.accessSync(prefer, fs.constants.W_OK);
+    return prefer;
+  } catch (err) {
+    const fallback = path.resolve(fallbackPath);
+    try {
+      if (!fs.existsSync(fallback)) fs.mkdirSync(fallback, { recursive: true });
+      fs.accessSync(fallback, fs.constants.W_OK);
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[thumbcache] Cannot use "${prefer}" (${err?.code || err}). Falling back to "${fallback}".`
+      );
+      return fallback;
+    } catch (err2) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[thumbcache] Cannot use "${prefer}" and fallback "${fallback}" (${err2?.code || err2}). Thumbnails disabled.`
+      );
+      return null;
+    }
+  }
+}
+
+const DEFAULT_THUMB_CACHE_DIR = (() => {
+  const primaryRoot = MEDIA_ROOTS[0]?.abs || __dirname;
+  // Keep cache with the media volume by default (works great for your VAULT mount).
+  return path.join(primaryRoot, ".mediaserver-cache", "thumbcache");
+})();
+
+const THUMB_CACHE = ensureWritableDir(
+  process.env.THUMB_CACHE_DIR || DEFAULT_THUMB_CACHE_DIR,
+  path.join(os.tmpdir(), "mediaserver-thumbcache")
+);
 
 function resolveVirtualMediaPath(virtualPath) {
   const normalized = String(virtualPath || "")
@@ -222,9 +258,10 @@ app.get("/api/media", (req, res) => {
 });
 
 // 2. Thumbnails (Cached, 600px, Low Quality)
-if (!fs.existsSync(THUMB_CACHE)) fs.mkdirSync(THUMB_CACHE, { recursive: true });
+// (Directory is created/validated above; can be null if thumbs are disabled)
 
 app.get("/thumb/*", async (req, res) => {
+  if (!THUMB_CACHE) return res.status(503).send("Thumbnail cache unavailable");
   const rel = req.params[0];
   const resolved = resolveVirtualMediaPath(rel);
   if (!resolved) return res.status(400).send("Bad path");

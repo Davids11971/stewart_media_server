@@ -18,6 +18,8 @@ try {
 } catch {}
 
 const app = express();
+// Avoid conditional GET 304s on JSON endpoints (some clients/fetch flows expect a body every time)
+app.set("etag", false);
 const PORT = Number.parseInt(process.env.PORT || "4000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 
@@ -350,6 +352,7 @@ function scanFolder(rootFolderPath, { rootId, rootAbs }) {
 // --- Routes ---
 
 app.get("/healthz", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   res.json({
     ok: true,
     port: PORT,
@@ -374,6 +377,7 @@ app.get("/healthz", (req, res) => {
 
 if (DEBUG_ENDPOINTS) {
   app.get("/debug/config", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
     res.json({
       port: PORT,
       host: HOST,
@@ -405,6 +409,7 @@ if (DEBUG_ENDPOINTS) {
   });
 
   app.get("/debug/routes", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
     const routes = [];
     // eslint-disable-next-line no-underscore-dangle
     for (const layer of app._router?.stack || []) {
@@ -421,6 +426,7 @@ if (DEBUG_ENDPOINTS) {
 
 // 1. API List
 app.get("/api/media", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   const started = process.hrtime.bigint();
   const result = {};
   for (const folder of FOLDERS) {

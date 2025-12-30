@@ -172,6 +172,35 @@ curl http://localhost:4000/healthz
 From another device on your LAN:
 - `http://<pi-ip>:4000/api/media`
 
+### If ping works but port 4000 is NOT reachable (common)
+If your Windows PC shows `PingSucceeded: True` but `TcpTestSucceeded: False`, the Pi is either:
+- not running the server
+- running it on a different port
+- blocked by a firewall
+
+Run these **on the Pi**:
+
+```bash
+# 1) Is anything listening on 4000, and on which interface?
+sudo ss -lntp | grep ':4000' || true
+
+# 2) Is the service running (if you use systemd)?
+sudo systemctl status mediaserver --no-pager
+
+# 3) Quick local checks from the Pi itself
+curl -sS http://127.0.0.1:4000/healthz
+curl -sS http://localhost:4000/healthz
+```
+
+If you use UFW, allow the port:
+
+```bash
+sudo ufw status
+sudo ufw allow 4000/tcp
+```
+
+Also watch the server startup logs: it prints the LAN URLs it thinks you can use (like `http://192.168.x.x:4000`).
+
 ---
 
 ## Run at boot (systemd)

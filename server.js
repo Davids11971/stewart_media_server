@@ -19,6 +19,7 @@ try {
 
 const app = express();
 const PORT = Number.parseInt(process.env.PORT || "4000", 10);
+const HOST = process.env.HOST || "0.0.0.0";
 
 // === CONFIG ===
 // On Raspberry Pi / Linux this is typically something like: /media/<user>/<driveLabel>
@@ -236,6 +237,7 @@ app.get("/healthz", (req, res) => {
   res.json({
     ok: true,
     port: PORT,
+    host: HOST,
     roots: MEDIA_ROOTS.map((r) => ({ id: r.id, path: r.rootPath })),
     folders: FOLDERS,
   });
@@ -368,6 +370,27 @@ app.get("/media/*", (req, res) => {
 });
 
 // Listen
-app.listen(PORT, "0.0.0.0", () =>
-  console.log(`🚀 Optimized Media Server running on http://0.0.0.0:${PORT}`)
-);
+function getLanUrls({ host, port }) {
+  const urls = [];
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name] || []) {
+      const family = net.family || net.address?.includes(":") ? "IPv6" : "IPv4";
+      if (net.internal) continue;
+      if (family !== "IPv4") continue; // keep output simple
+      urls.push(`http://${net.address}:${port}`);
+    }
+  }
+  // Always include what we actually bind to (useful for debugging)
+  urls.unshift(`http://${host}:${port}`);
+  return Array.from(new Set(urls));
+}
+
+app.listen(PORT, HOST, () => {
+  const urls = getLanUrls({ host: HOST, port: PORT });
+  // eslint-disable-next-line no-console
+  console.log("🚀 Optimized Media Server listening:");
+  for (const u of urls) console.log(`- ${u}`);
+  console.log("- Health:", `${urls[0]}/healthz`);
+  console.log("- Media API:", `${urls[0]}/api/media`);
+});

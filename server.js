@@ -21,6 +21,101 @@ const app = express();
 const PORT = Number.parseInt(process.env.PORT || "4000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 
+// === LOGGING / DEBUG ===
+// Turn these on/off via env vars (good for Raspberry Pi systemd)
+const LOG_LEVEL = String(process.env.LOG_LEVEL || "info").toLowerCase(); // error|warn|info|debug|trace
+const LOG_REQUESTS = String(process.env.LOG_REQUESTS || "1") === "1";
+const LOG_REQUEST_HEADERS = String(process.env.LOG_REQUEST_HEADERS || "0") === "1";
+const LOG_RESPONSE_HEADERS = String(process.env.LOG_RESPONSE_HEADERS || "0") === "1";
+const LOG_SCAN = String(process.env.LOG_SCAN || "0") === "1";
+const LOG_RESOLVE = String(process.env.LOG_RESOLVE || "0") === "1";
+const LOG_CORS = String(process.env.LOG_CORS || "0") === "1";
+const LOG_STREAM = String(process.env.LOG_STREAM || "0") === "1";
+const LOG_THUMBS = String(process.env.LOG_THUMBS || "0") === "1";
+const DEBUG_ENDPOINTS = String(process.env.DEBUG_ENDPOINTS || "0") === "1";
+const REQUEST_TIMEOUT_MS = Number.parseInt(process.env.REQUEST_TIMEOUT_MS || "0", 10); // 0 = disabled
+
+const LEVELS = { error: 0, warn: 1, info: 2, debug: 3, trace: 4 };
+function shouldLog(level) {
+  const cur = LEVELS[LOG_LEVEL] ?? LEVELS.info;
+  const want = LEVELS[level] ?? LEVELS.info;
+  return want <= cur;
+}
+function safeJson(obj) {
+  try { return JSON.stringify(obj); } catch { return "\"<unserializable>\""; }
+}
+function log(level, msg, meta) {
+  if (!shouldLog(level)) return;
+  const line = meta ? `${msg} ${safeJson(meta)}` : msg;
+  // eslint-disable-next-line no-console
+  (level === "error" ? console.error : level === "warn" ? console.warn : console.log)(line);
+}
+function redactHeaders(headers) {
+  const h = { ...(headers || {}) };
+  for (const k of Object.keys(h)) {
+    if (String(k).toLowerCase() === "authorization") h[k] = "<redacted>";
+    if (String(k).toLowerCase() === "cookie") h[k] = "<redacted>";
+  }
+  return h;
+}
+function getClientIp(req) {
+  const xfwd = req.headers["x-forwarded-for"];
+  if (xfwd) return String(xfwd).split(",")[0].trim();
+  return req.socket?.remoteAddress || req.ip;
+}
+function newRequestId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+function hrMs(start) {
+  const diff = process.hrtime.bigint() - start;
+  return Number(diff / 1000000n);
+}
+
+// Optional timeout (helps catch hung requests)
+if (REQUEST_TIMEOUT_MS > 0) {
+  app.use((req, res, next) => {
+    res.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      const rid = req.requestId || "<no-rid>";
+      log("warn", "[timeout] request exceeded timeout", { rid, ms: REQUEST_TIMEOUT_MS, method: req.method, url: req.originalUrl });
+      try { res.status(408).json({ error: "Request timeout", requestId: rid, ms: REQUEST_TIMEOUT_MS }); } catch {}
+    });
+    next();
+  });
+}
+
+// Request ID + request logging
+app.use((req, res, next) => {
+  req.requestId = req.headers["x-request-id"] ? String(req.headers["x-request-id"]) : newRequestId();
+  res.setHeader("x-request-id", req.requestId);
+
+  if (!LOG_REQUESTS) return next();
+
+  const start = process.hrtime.bigint();
+  const ip = getClientIp(req);
+  const baseMeta = {
+    rid: req.requestId,
+    ip,
+    method: req.method,
+    url: req.originalUrl,
+    ua: req.headers["user-agent"],
+  };
+
+  if (LOG_REQUEST_HEADERS) {
+    log("debug", "[http] request headers", { ...baseMeta, headers: redactHeaders(req.headers) });
+  } else {
+    log("info", "[http] request", baseMeta);
+  }
+
+  res.on("finish", () => {
+    const ms = hrMs(start);
+    const meta = { ...baseMeta, status: res.statusCode, ms };
+    if (LOG_RESPONSE_HEADERS) meta.resHeaders = redactHeaders(res.getHeaders());
+    log(res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info", "[http] response", meta);
+  });
+
+  next();
+});
+
 // === CONFIG ===
 // On Raspberry Pi / Linux this is typically something like: /media/<user>/<driveLabel>
 // On Windows you might use something like: G:/ or D:/Media
@@ -51,7 +146,15 @@ const ALLOWED_EXTS = [
   ".jpg", ".jpeg", ".png", ".gif", ".webp"
 ];
 
-app.use(cors());
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (LOG_CORS) log("debug", "[cors] origin check", { origin });
+      cb(null, true); // allow all (current behavior)
+    },
+    credentials: false,
+  })
+);
 
 // --- Helpers ---
 function isVideo(file) {
@@ -142,7 +245,10 @@ function resolveVirtualMediaPath(virtualPath) {
     .replace(/\\/g, "/")
     .replace(/^\/+/, "");
 
-  if (!normalized) return null;
+  if (!normalized) {
+    if (LOG_RESOLVE) log("warn", "[resolve] empty path", { rid: "<unknown>" });
+    return null;
+  }
 
   const parts = normalized.split("/").filter(Boolean);
   if (parts.length === 0) return null;
@@ -160,7 +266,10 @@ function resolveVirtualMediaPath(virtualPath) {
     relativeWithinRoot = parts.join("/");
   }
 
-  if (!chosenRoot) return null;
+  if (!chosenRoot) {
+    if (LOG_RESOLVE) log("warn", "[resolve] unknown rootId", { rootId: maybeRootId, parts, roots: MEDIA_ROOTS.map((r) => r.id) });
+    return null;
+  }
 
   const candidateAbs = path.resolve(chosenRoot.abs, relativeWithinRoot);
   const rootPrefix = chosenRoot.abs.endsWith(path.sep)
@@ -169,6 +278,7 @@ function resolveVirtualMediaPath(virtualPath) {
 
   // Prevent path traversal outside the configured root
   if (candidateAbs !== chosenRoot.abs && !candidateAbs.startsWith(rootPrefix)) {
+    if (LOG_RESOLVE) log("warn", "[resolve] traversal blocked", { root: chosenRoot.id, candidateAbs, rootAbs: chosenRoot.abs });
     return null;
   }
 
@@ -188,13 +298,19 @@ function scanFolder(rootFolderPath, { rootId, rootAbs }) {
 
   function walk(currentPath) {
     let files;
-    try { files = fs.readdirSync(currentPath); } catch { return; }
+    try { files = fs.readdirSync(currentPath); } catch (err) {
+      if (LOG_SCAN) log("warn", "[scan] cannot read dir", { rootId, dir: currentPath, err: err?.code || String(err) });
+      return;
+    }
 
     for (const f of files) {
       if (f.startsWith("$") || f.startsWith(".")) continue;
       const fullPath = path.join(currentPath, f);
       let stat;
-      try { stat = fs.statSync(fullPath); } catch { continue; }
+      try { stat = fs.statSync(fullPath); } catch (err) {
+        if (LOG_SCAN) log("warn", "[scan] stat failed", { rootId, fullPath, err: err?.code || String(err) });
+        continue;
+      }
 
       if (stat.isDirectory()) {
         walk(fullPath);
@@ -240,21 +356,92 @@ app.get("/healthz", (req, res) => {
     host: HOST,
     roots: MEDIA_ROOTS.map((r) => ({ id: r.id, path: r.rootPath })),
     folders: FOLDERS,
+    logging: {
+      level: LOG_LEVEL,
+      requests: LOG_REQUESTS,
+      requestHeaders: LOG_REQUEST_HEADERS,
+      responseHeaders: LOG_RESPONSE_HEADERS,
+      scan: LOG_SCAN,
+      resolve: LOG_RESOLVE,
+      cors: LOG_CORS,
+      stream: LOG_STREAM,
+      thumbs: LOG_THUMBS,
+      debugEndpoints: DEBUG_ENDPOINTS,
+      requestTimeoutMs: REQUEST_TIMEOUT_MS,
+    },
   });
 });
 
+if (DEBUG_ENDPOINTS) {
+  app.get("/debug/config", (req, res) => {
+    res.json({
+      port: PORT,
+      host: HOST,
+      nodeEnv: process.env.NODE_ENV,
+      platform: process.platform,
+      arch: process.arch,
+      pid: process.pid,
+      cwd: process.cwd(),
+      mediaRootsRaw: MEDIA_ROOTS_RAW,
+      mediaRoots: MEDIA_ROOTS,
+      folders: FOLDERS,
+      thumbCache: THUMB_CACHE,
+      videoChunkSize: VIDEO_CHUNK_SIZE,
+      logging: {
+        level: LOG_LEVEL,
+        requests: LOG_REQUESTS,
+        requestHeaders: LOG_REQUEST_HEADERS,
+        responseHeaders: LOG_RESPONSE_HEADERS,
+        scan: LOG_SCAN,
+        resolve: LOG_RESOLVE,
+        cors: LOG_CORS,
+        stream: LOG_STREAM,
+        thumbs: LOG_THUMBS,
+        debugEndpoints: DEBUG_ENDPOINTS,
+        requestTimeoutMs: REQUEST_TIMEOUT_MS,
+      },
+      networkInterfaces: os.networkInterfaces(),
+    });
+  });
+
+  app.get("/debug/routes", (req, res) => {
+    const routes = [];
+    // eslint-disable-next-line no-underscore-dangle
+    for (const layer of app._router?.stack || []) {
+      if (layer.route?.path) {
+        routes.push({
+          path: layer.route.path,
+          methods: Object.keys(layer.route.methods || {}).filter((m) => layer.route.methods[m]),
+        });
+      }
+    }
+    res.json({ count: routes.length, routes });
+  });
+}
+
 // 1. API List
 app.get("/api/media", (req, res) => {
+  const started = process.hrtime.bigint();
   const result = {};
   for (const folder of FOLDERS) {
     const combined = [];
     for (const root of MEDIA_ROOTS) {
       const fullPath = path.join(root.abs, folder);
       if (fs.existsSync(fullPath)) {
+        if (LOG_SCAN) log("info", "[api/media] scanning", { rid: req.requestId, root: root.id, folder, fullPath });
         combined.push(...scanFolder(fullPath, { rootId: root.id, rootAbs: root.abs }));
+      } else if (LOG_SCAN) {
+        log("debug", "[api/media] folder missing", { rid: req.requestId, root: root.id, folder, fullPath });
       }
     }
     result[folder] = combined;
+  }
+  if (LOG_SCAN) {
+    log("info", "[api/media] scan complete", {
+      rid: req.requestId,
+      ms: hrMs(started),
+      counts: Object.fromEntries(Object.entries(result).map(([k, v]) => [k, Array.isArray(v) ? v.length : 0])),
+    });
   }
   res.json(result);
 });
@@ -266,16 +453,23 @@ app.get("/thumb/*", async (req, res) => {
   if (!THUMB_CACHE) return res.status(503).send("Thumbnail cache unavailable");
   const rel = req.params[0];
   const resolved = resolveVirtualMediaPath(rel);
-  if (!resolved) return res.status(400).send("Bad path");
+  if (!resolved) {
+    if (LOG_THUMBS || LOG_RESOLVE) log("warn", "[thumb] bad path", { rid: req.requestId, rel });
+    return res.status(400).send("Bad path");
+  }
   const srcPath = resolved.absPath;
   
-  if (!fs.existsSync(srcPath)) return res.status(404).end();
+  if (!fs.existsSync(srcPath)) {
+    if (LOG_THUMBS) log("warn", "[thumb] missing source", { rid: req.requestId, srcPath, rel });
+    return res.status(404).end();
+  }
   // Return cached if exists
   const thumbFile = path.join(
     THUMB_CACHE,
     resolved.virtualKey.replace(/[\\/]/g, "_") + ".jpg"
   );
   if (fs.existsSync(thumbFile)) {
+    if (LOG_THUMBS) log("debug", "[thumb] cache hit", { rid: req.requestId, thumbFile, srcPath });
     res.setHeader("Cache-Control", "public, max-age=604800"); 
     return res.sendFile(thumbFile);
   }
@@ -283,6 +477,7 @@ app.get("/thumb/*", async (req, res) => {
   // Generate
   try {
     if (isVideo(srcPath)) return res.status(400).send("No video thumbs");
+    if (LOG_THUMBS) log("info", "[thumb] generating", { rid: req.requestId, srcPath, thumbFile });
     
     await sharp(srcPath)
       .rotate()
@@ -293,7 +488,7 @@ app.get("/thumb/*", async (req, res) => {
     res.setHeader("Cache-Control", "public, max-age=604800");
     res.sendFile(thumbFile);
   } catch (err) {
-    // console.error("Thumb error:", err); // Suppress video thumb errors
+    log("error", "[thumb] error", { rid: req.requestId, srcPath, thumbFile, err: String(err) });
     res.status(500).end();
   }
 });
@@ -302,13 +497,20 @@ app.get("/thumb/*", async (req, res) => {
 app.get("/view/*", async (req, res) => {
   const rel = req.params[0];
   const resolved = resolveVirtualMediaPath(rel);
-  if (!resolved) return res.status(400).send("Bad path");
+  if (!resolved) {
+    if (LOG_RESOLVE) log("warn", "[view] bad path", { rid: req.requestId, rel });
+    return res.status(400).send("Bad path");
+  }
   const srcPath = resolved.absPath;
 
-  if (!fs.existsSync(srcPath)) return res.status(404).end();
+  if (!fs.existsSync(srcPath)) {
+    log("warn", "[view] missing source", { rid: req.requestId, srcPath, rel });
+    return res.status(404).end();
+  }
   if (isVideo(srcPath)) return res.redirect(`/stream/${rel}`);
 
   try {
+    if (LOG_THUMBS) log("debug", "[view] optimizing image", { rid: req.requestId, srcPath });
     const transform = sharp(srcPath)
       .rotate()
       .resize({ width: 1920, withoutEnlargement: true })
@@ -318,6 +520,7 @@ app.get("/view/*", async (req, res) => {
     res.setHeader("Cache-Control", "public, max-age=86400");
     transform.pipe(res);
   } catch (err) {
+    log("warn", "[view] sharp failed, sending original", { rid: req.requestId, srcPath, err: String(err) });
     fs.createReadStream(srcPath).pipe(res);
   }
 });
@@ -326,15 +529,31 @@ app.get("/view/*", async (req, res) => {
 app.get("/stream/*", (req, res) => {
   const rel = req.params[0];
   const resolved = resolveVirtualMediaPath(rel);
-  if (!resolved) return res.status(400).send("Bad path");
+  if (!resolved) {
+    if (LOG_RESOLVE || LOG_STREAM) log("warn", "[stream] bad path", { rid: req.requestId, rel });
+    return res.status(400).send("Bad path");
+  }
   const filePath = resolved.absPath;
   
-  if (!fs.existsSync(filePath)) return res.status(404).end();
+  if (!fs.existsSync(filePath)) {
+    if (LOG_STREAM) log("warn", "[stream] missing file", { rid: req.requestId, filePath, rel });
+    return res.status(404).end();
+  }
 
   const stat = fs.statSync(filePath);
   const fileSize = stat.size;
   const range = req.headers.range;
   const mimeType = getMimeType(filePath, "video/mp4");
+
+  if (LOG_STREAM) {
+    log("info", "[stream] request", {
+      rid: req.requestId,
+      filePath,
+      size: fileSize,
+      range: range || null,
+      mime: mimeType,
+    });
+  }
 
   if (range) {
     const parts = range.replace(/bytes=/, "").split("-");
@@ -363,10 +582,31 @@ app.get("/stream/*", (req, res) => {
 app.get("/media/*", (req, res) => {
   const rel = req.params[0];
   const resolved = resolveVirtualMediaPath(rel);
-  if (!resolved) return res.status(400).send("Bad path");
+  if (!resolved) {
+    if (LOG_RESOLVE) log("warn", "[media] bad path", { rid: req.requestId, rel });
+    return res.status(400).send("Bad path");
+  }
   const filePath = resolved.absPath;
-  if (fs.existsSync(filePath)) res.sendFile(filePath);
-  else res.status(404).end();
+  if (fs.existsSync(filePath)) {
+    log("info", "[media] sendFile", { rid: req.requestId, filePath });
+    res.sendFile(filePath);
+  } else {
+    log("warn", "[media] missing file", { rid: req.requestId, filePath, rel });
+    res.status(404).end();
+  }
+});
+
+// Central error handler (last middleware)
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  log("error", "[express] unhandled error", {
+    rid: req?.requestId,
+    method: req?.method,
+    url: req?.originalUrl,
+    err: String(err?.stack || err),
+  });
+  if (res.headersSent) return;
+  res.status(500).json({ error: "Internal Server Error", requestId: req?.requestId });
 });
 
 // Listen
@@ -389,8 +629,33 @@ function getLanUrls({ host, port }) {
 app.listen(PORT, HOST, () => {
   const urls = getLanUrls({ host: HOST, port: PORT });
   // eslint-disable-next-line no-console
-  console.log("🚀 Optimized Media Server listening:");
+  log("info", "🚀 Optimized Media Server listening:", {
+    host: HOST,
+    port: PORT,
+    nodeEnv: process.env.NODE_ENV,
+    platform: process.platform,
+    pid: process.pid,
+    cwd: process.cwd(),
+    mediaRootsRaw: MEDIA_ROOTS_RAW,
+    mediaRoots: MEDIA_ROOTS,
+    folders: FOLDERS,
+    thumbCache: THUMB_CACHE,
+    videoChunkSize: VIDEO_CHUNK_SIZE,
+    logging: {
+      level: LOG_LEVEL,
+      requests: LOG_REQUESTS,
+      requestHeaders: LOG_REQUEST_HEADERS,
+      responseHeaders: LOG_RESPONSE_HEADERS,
+      scan: LOG_SCAN,
+      resolve: LOG_RESOLVE,
+      cors: LOG_CORS,
+      stream: LOG_STREAM,
+      thumbs: LOG_THUMBS,
+      debugEndpoints: DEBUG_ENDPOINTS,
+      requestTimeoutMs: REQUEST_TIMEOUT_MS,
+    },
+  });
   for (const u of urls) console.log(`- ${u}`);
-  console.log("- Health:", `${urls[0]}/healthz`);
-  console.log("- Media API:", `${urls[0]}/api/media`);
+  log("info", "- Health:", { url: `${urls[0]}/healthz` });
+  log("info", "- Media API:", { url: `${urls[0]}/api/media` });
 });

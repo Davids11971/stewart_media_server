@@ -203,6 +203,36 @@ Also watch the server startup logs: it prints the LAN URLs it thinks you can use
 
 ---
 
+## Pi: turn logging up to “a ton” (recommended while debugging)
+### Tail logs live (systemd)
+
+```bash
+sudo journalctl -u mediaserver -f -n 200
+```
+
+### Crank logging via `.env` (preferred)
+Edit `/home/pi/MediaServer/.env` and set:
+- `LOG_LEVEL=debug`
+- `LOG_REQUESTS=1`
+- Optional deep logs: `LOG_SCAN=1`, `LOG_RESOLVE=1`, `LOG_STREAM=1`, `LOG_THUMBS=1`
+- Optional: `DEBUG_ENDPOINTS=1` (enables `/debug/config`)
+
+Then restart:
+
+```bash
+sudo systemctl restart mediaserver
+sudo systemctl status mediaserver --no-pager
+```
+
+### Quick “what config is the server actually using?”
+If `DEBUG_ENDPOINTS=1`:
+
+```bash
+curl -sS http://127.0.0.1:4000/debug/config | head
+```
+
+---
+
 ## Run at boot (systemd)
 
 This repo includes a template unit file: `mediaserver.service`

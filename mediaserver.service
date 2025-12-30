@@ -12,6 +12,8 @@ Restart=always
 RestartSec=3
 Environment=NODE_ENV=production
 Environment=HOST=0.0.0.0
+Environment=LOG_LEVEL=info
+Environment=LOG_REQUESTS=1
 
 # Load your .env (recommended). If you don't use one, you can remove this line.
 EnvironmentFile=/home/pi/MediaServer/.env

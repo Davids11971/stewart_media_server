@@ -7,7 +7,8 @@ Wants=network-online.target
 Type=simple
 User=%i
 WorkingDirectory=/home/%i/stewart_media_server
-ExecStart=/usr/bin/node /home/%i/stewart_media_server/server.js
+Environment=HOME=/home/%i
+ExecStart=/home/%i/stewart_media_server/scripts/systemd-entrypoint.sh
 Restart=always
 RestartSec=3
 

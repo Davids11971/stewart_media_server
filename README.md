@@ -245,6 +245,8 @@ chmod +x ./scripts/install-systemd.sh
 ./scripts/install-systemd.sh
 ```
 
+Note: If you installed Node via **nvm**, the service uses `scripts/systemd-entrypoint.sh` to source `~/.nvm/nvm.sh` so systemd can find `node`.
+
 ### Manual install (if you prefer)
 1) Copy it into place:
 

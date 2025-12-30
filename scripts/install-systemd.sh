@@ -32,6 +32,9 @@ echo "- from: ${UNIT_SRC}"
 echo "- to:   ${UNIT_DST}"
 sudo cp "${UNIT_SRC}" "${UNIT_DST}"
 
+echo "Ensuring entrypoint is executable..."
+chmod +x "${REPO_DIR}/scripts/systemd-entrypoint.sh"
+
 echo "Reloading systemd..."
 sudo systemctl daemon-reload
 

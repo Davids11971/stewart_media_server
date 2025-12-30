@@ -207,7 +207,7 @@ Also watch the server startup logs: it prints the LAN URLs it thinks you can use
 ### Tail logs live (systemd)
 
 ```bash
-sudo journalctl -u mediaserver -f -n 200
+sudo journalctl -u mediaserver@${USER} -f -n 200
 ```
 
 ### Crank logging via `.env` (preferred)
@@ -235,26 +235,37 @@ curl -sS http://127.0.0.1:4000/debug/config | head
 
 ## Run at boot (systemd)
 
-This repo includes a template unit file: `mediaserver.service`
+This repo includes a systemd **instance** unit file: `mediaserver@.service`
 
+### Install (recommended)
+Run the installer script (auto-detects your user):
+
+```bash
+chmod +x ./scripts/install-systemd.sh
+./scripts/install-systemd.sh
+```
+
+### Manual install (if you prefer)
 1) Copy it into place:
 
 ```bash
-sudo cp mediaserver.service /etc/systemd/system/mediaserver.service
-```
-
-2) Edit paths/user if needed:
-
-```bash
-sudo nano /etc/systemd/system/mediaserver.service
-```
-
-3) Enable and start:
-
-```bash
+sudo cp mediaserver@.service /etc/systemd/system/mediaserver@.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now mediaserver
-sudo systemctl status mediaserver --no-pager
+```
+
+2) Enable and start (replace USER):
+
+```bash
+sudo systemctl enable --now mediaserver@USER
+sudo systemctl status mediaserver@USER --no-pager
+```
+
+### If Windows can SSH but cannot reach port 4000
+Run the read-only diagnostics script on the Pi:
+
+```bash
+chmod +x ./scripts/diag-network.sh
+./scripts/diag-network.sh 4000
 ```
 
 

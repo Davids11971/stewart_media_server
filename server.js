@@ -10,6 +10,7 @@ const path = require("path");
 const sharp = require("sharp"); // npm install sharp
 const mime = require("mime");   // npm install mime
 const cors = require("cors");
+const Busboy = require("busboy"); // npm install busboy
 
 
 const app = express();
@@ -130,6 +131,9 @@ const MEDIA_ROOT = process.platform === "win32"
 
 const FOLDERS = ["Photos", "Videos", "Movies", "TVShows", "Documents"];
 
+// User upload folders - created on startup
+const USER_FOLDERS = ["John", "Max", "Juliette", "Thomas", "David", "Shared"];
+
 const VIDEO_CHUNK_SIZE = 1024 * 1024; // 1MB
 
 const ALLOWED_EXTS = [".mp4", ".mov", ".avi", ".mkv", ".jpg", ".jpeg", ".png", ".gif", ".webp"];
@@ -224,6 +228,35 @@ const THUMB_CACHE = ensureWritableDir(
   process.env.THUMB_CACHE_DIR || DEFAULT_THUMB_CACHE_DIR,
   path.join(os.tmpdir(), "mediaserver-thumbcache")
 );
+
+// === USER UPLOAD FOLDERS ===
+// Create user folders on startup if they don't exist
+const UPLOADS_ROOT = path.join(MEDIA_ROOTS[0].abs, "Uploads");
+function ensureUserFolders() {
+  // Create main Uploads folder
+  if (!fs.existsSync(UPLOADS_ROOT)) {
+    try {
+      fs.mkdirSync(UPLOADS_ROOT, { recursive: true });
+      log("info", "[startup] Created Uploads folder", { path: UPLOADS_ROOT });
+    } catch (err) {
+      log("error", "[startup] Failed to create Uploads folder", { path: UPLOADS_ROOT, err: String(err) });
+    }
+  }
+  
+  // Create each user folder
+  for (const user of USER_FOLDERS) {
+    const userPath = path.join(UPLOADS_ROOT, user);
+    if (!fs.existsSync(userPath)) {
+      try {
+        fs.mkdirSync(userPath, { recursive: true });
+        log("info", "[startup] Created user folder", { user, path: userPath });
+      } catch (err) {
+        log("error", "[startup] Failed to create user folder", { user, path: userPath, err: String(err) });
+      }
+    }
+  }
+}
+ensureUserFolders();
 
 function resolveVirtualMediaPath(virtualPath) {
   const normalized = String(virtualPath || "")
@@ -342,6 +375,8 @@ app.get("/healthz", (req, res) => {
     host: HOST,
     roots: MEDIA_ROOTS.map((r) => ({ id: r.id, path: r.rootPath })),
     folders: FOLDERS,
+    userFolders: USER_FOLDERS,
+    uploadsRoot: UPLOADS_ROOT,
     logging: {
       level: LOG_LEVEL,
       requests: LOG_REQUESTS,
@@ -584,6 +619,564 @@ app.get("/media/*", (req, res) => {
   }
 });
 
+// =====================================================
+// === UPLOAD & FOLDER MANAGEMENT API ===
+// =====================================================
+
+// Helper: Validate user folder
+function isValidUserFolder(userFolder) {
+  return USER_FOLDERS.includes(userFolder);
+}
+
+// Helper: Sanitize filename (remove dangerous characters)
+function sanitizeFilename(filename) {
+  return String(filename || "file")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/\.{2,}/g, ".")
+    .trim() || "file";
+}
+
+// Helper: Sanitize folder name
+function sanitizeFolderName(name) {
+  return String(name || "")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/\.{2,}/g, ".")
+    .replace(/^\.+|\.+$/g, "")
+    .trim();
+}
+
+// Helper: Resolve upload path safely (prevent traversal)
+function resolveUploadPath(userFolder, subPath = "") {
+  if (!isValidUserFolder(userFolder)) return null;
+  
+  const userRoot = path.join(UPLOADS_ROOT, userFolder);
+  const targetPath = subPath 
+    ? path.resolve(userRoot, subPath.replace(/\\/g, "/").replace(/^\/+/, ""))
+    : userRoot;
+  
+  // Prevent path traversal
+  if (!targetPath.startsWith(userRoot)) {
+    return null;
+  }
+  
+  return { userRoot, targetPath };
+}
+
+// 6. Get list of user folders
+app.get("/api/users", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    users: USER_FOLDERS,
+    uploadsRoot: "Uploads"
+  });
+});
+
+// 7. List contents of a user folder (with optional subpath)
+app.get("/api/folders/:userFolder", (req, res) => {
+  const { userFolder } = req.params;
+  const subPath = req.query.path || "";
+  
+  const resolved = resolveUploadPath(userFolder, subPath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid user folder or path" });
+  }
+  
+  const { targetPath } = resolved;
+  
+  if (!fs.existsSync(targetPath)) {
+    return res.status(404).json({ error: "Path not found" });
+  }
+  
+  try {
+    const stat = fs.statSync(targetPath);
+    if (!stat.isDirectory()) {
+      return res.status(400).json({ error: "Path is not a directory" });
+    }
+    
+    const entries = fs.readdirSync(targetPath, { withFileTypes: true });
+    const items = entries
+      .filter(e => !e.name.startsWith(".") && !e.name.startsWith("$"))
+      .map(e => {
+        const fullPath = path.join(targetPath, e.name);
+        const stats = fs.statSync(fullPath);
+        const relativePath = path.relative(UPLOADS_ROOT, fullPath).replace(/\\/g, "/");
+        
+        return {
+          name: e.name,
+          type: e.isDirectory() ? "folder" : "file",
+          size: e.isDirectory() ? null : stats.size,
+          modified: stats.mtimeMs,
+          path: relativePath,
+          // For media files, include the virtual path for streaming/viewing
+          mediaPath: e.isFile() ? `vault/Uploads/${relativePath}` : null
+        };
+      });
+    
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      user: userFolder,
+      currentPath: subPath || "/",
+      items
+    });
+  } catch (err) {
+    log("error", "[folders] list error", { rid: req.requestId, userFolder, subPath, err: String(err) });
+    res.status(500).json({ error: "Failed to list folder" });
+  }
+});
+
+// 8. Create a new folder within a user folder
+app.post("/api/folders/:userFolder", express.json(), (req, res) => {
+  const { userFolder } = req.params;
+  const { name, path: subPath = "" } = req.body;
+  
+  if (!name) {
+    return res.status(400).json({ error: "Folder name is required" });
+  }
+  
+  const sanitizedName = sanitizeFolderName(name);
+  if (!sanitizedName) {
+    return res.status(400).json({ error: "Invalid folder name" });
+  }
+  
+  const resolved = resolveUploadPath(userFolder, subPath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid user folder or path" });
+  }
+  
+  const newFolderPath = path.join(resolved.targetPath, sanitizedName);
+  
+  // Verify still within user root
+  if (!newFolderPath.startsWith(resolved.userRoot)) {
+    return res.status(400).json({ error: "Invalid path" });
+  }
+  
+  if (fs.existsSync(newFolderPath)) {
+    return res.status(409).json({ error: "Folder already exists" });
+  }
+  
+  try {
+    fs.mkdirSync(newFolderPath, { recursive: true });
+    log("info", "[folders] created", { rid: req.requestId, userFolder, path: newFolderPath });
+    
+    const relativePath = path.relative(UPLOADS_ROOT, newFolderPath).replace(/\\/g, "/");
+    res.status(201).json({
+      success: true,
+      name: sanitizedName,
+      path: relativePath
+    });
+  } catch (err) {
+    log("error", "[folders] create error", { rid: req.requestId, userFolder, err: String(err) });
+    res.status(500).json({ error: "Failed to create folder" });
+  }
+});
+
+// 9. Delete a folder (must be empty)
+app.delete("/api/folders/:userFolder", express.json(), (req, res) => {
+  const { userFolder } = req.params;
+  const subPath = req.query.path || req.body?.path;
+  
+  if (!subPath) {
+    return res.status(400).json({ error: "Cannot delete user root folder" });
+  }
+  
+  const resolved = resolveUploadPath(userFolder, subPath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid user folder or path" });
+  }
+  
+  // Prevent deleting user root
+  if (resolved.targetPath === resolved.userRoot) {
+    return res.status(400).json({ error: "Cannot delete user root folder" });
+  }
+  
+  if (!fs.existsSync(resolved.targetPath)) {
+    return res.status(404).json({ error: "Folder not found" });
+  }
+  
+  try {
+    const stat = fs.statSync(resolved.targetPath);
+    if (!stat.isDirectory()) {
+      return res.status(400).json({ error: "Path is not a directory" });
+    }
+    
+    // Check if empty
+    const contents = fs.readdirSync(resolved.targetPath);
+    if (contents.length > 0) {
+      return res.status(400).json({ error: "Folder is not empty" });
+    }
+    
+    fs.rmdirSync(resolved.targetPath);
+    log("info", "[folders] deleted", { rid: req.requestId, userFolder, path: resolved.targetPath });
+    res.json({ success: true });
+  } catch (err) {
+    log("error", "[folders] delete error", { rid: req.requestId, userFolder, err: String(err) });
+    res.status(500).json({ error: "Failed to delete folder" });
+  }
+});
+
+// 10. Upload file(s) - Streaming upload with busboy (no size limits, memory efficient)
+app.post("/api/upload/:userFolder", (req, res) => {
+  const { userFolder } = req.params;
+  const subPath = req.query.path || "";
+  
+  const resolved = resolveUploadPath(userFolder, subPath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid user folder or path" });
+  }
+  
+  // Ensure target directory exists
+  if (!fs.existsSync(resolved.targetPath)) {
+    try {
+      fs.mkdirSync(resolved.targetPath, { recursive: true });
+    } catch (err) {
+      return res.status(500).json({ error: "Failed to create target directory" });
+    }
+  }
+  
+  const busboy = Busboy({ 
+    headers: req.headers,
+    limits: {
+      // No file size limit - we stream directly to disk
+      fileSize: Infinity,
+      files: 100 // Max 100 files per request
+    }
+  });
+  
+  const uploadedFiles = [];
+  const errors = [];
+  let fileCount = 0;
+  
+  busboy.on("file", (fieldname, file, info) => {
+    const { filename, encoding, mimeType } = info;
+    const sanitizedFilename = sanitizeFilename(filename);
+    const savePath = path.join(resolved.targetPath, sanitizedFilename);
+    
+    // Verify still within user root
+    if (!savePath.startsWith(resolved.userRoot)) {
+      errors.push({ filename, error: "Invalid path" });
+      file.resume(); // Drain the stream
+      return;
+    }
+    
+    fileCount++;
+    const fileIndex = fileCount;
+    const startTime = process.hrtime.bigint();
+    let bytesWritten = 0;
+    
+    log("info", "[upload] starting", { 
+      rid: req.requestId, 
+      userFolder, 
+      filename: sanitizedFilename, 
+      mimeType,
+      fileIndex
+    });
+    
+    const writeStream = fs.createWriteStream(savePath);
+    
+    file.on("data", (chunk) => {
+      bytesWritten += chunk.length;
+    });
+    
+    file.pipe(writeStream);
+    
+    writeStream.on("finish", () => {
+      const ms = hrMs(startTime);
+      const mbps = bytesWritten > 0 ? ((bytesWritten / 1024 / 1024) / (ms / 1000)).toFixed(2) : 0;
+      
+      log("info", "[upload] complete", { 
+        rid: req.requestId, 
+        filename: sanitizedFilename, 
+        bytes: bytesWritten,
+        ms,
+        mbps: `${mbps} MB/s`
+      });
+      
+      const relativePath = path.relative(UPLOADS_ROOT, savePath).replace(/\\/g, "/");
+      uploadedFiles.push({
+        filename: sanitizedFilename,
+        originalName: filename,
+        size: bytesWritten,
+        path: relativePath,
+        mediaPath: `vault/Uploads/${relativePath}`,
+        mimeType,
+        uploadTimeMs: ms
+      });
+    });
+    
+    writeStream.on("error", (err) => {
+      log("error", "[upload] write error", { rid: req.requestId, filename: sanitizedFilename, err: String(err) });
+      errors.push({ filename: sanitizedFilename, error: String(err) });
+    });
+    
+    file.on("error", (err) => {
+      log("error", "[upload] stream error", { rid: req.requestId, filename: sanitizedFilename, err: String(err) });
+      errors.push({ filename: sanitizedFilename, error: String(err) });
+    });
+  });
+  
+  busboy.on("finish", () => {
+    // Wait a tick for all write streams to finish
+    setTimeout(() => {
+      if (errors.length > 0 && uploadedFiles.length === 0) {
+        res.status(500).json({ error: "Upload failed", errors });
+      } else {
+        res.json({
+          success: true,
+          uploaded: uploadedFiles,
+          errors: errors.length > 0 ? errors : undefined
+        });
+      }
+    }, 100);
+  });
+  
+  busboy.on("error", (err) => {
+    log("error", "[upload] busboy error", { rid: req.requestId, err: String(err) });
+    res.status(500).json({ error: "Upload processing failed" });
+  });
+  
+  req.pipe(busboy);
+});
+
+// 11. Chunked upload - Initialize (for resumable uploads of very large files)
+const activeChunkedUploads = new Map();
+
+app.post("/api/upload/:userFolder/chunked/init", express.json(), (req, res) => {
+  const { userFolder } = req.params;
+  const { filename, totalSize, totalChunks, path: subPath = "" } = req.body;
+  
+  if (!filename || !totalSize || !totalChunks) {
+    return res.status(400).json({ error: "Missing required fields: filename, totalSize, totalChunks" });
+  }
+  
+  const resolved = resolveUploadPath(userFolder, subPath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid user folder or path" });
+  }
+  
+  const sanitizedFilename = sanitizeFilename(filename);
+  const uploadId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const tempDir = path.join(os.tmpdir(), "mediaserver-chunks", uploadId);
+  
+  try {
+    fs.mkdirSync(tempDir, { recursive: true });
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to create temp directory" });
+  }
+  
+  const uploadMeta = {
+    uploadId,
+    userFolder,
+    subPath,
+    filename: sanitizedFilename,
+    originalName: filename,
+    totalSize,
+    totalChunks,
+    receivedChunks: new Set(),
+    tempDir,
+    targetPath: resolved.targetPath,
+    userRoot: resolved.userRoot,
+    startTime: Date.now()
+  };
+  
+  activeChunkedUploads.set(uploadId, uploadMeta);
+  
+  log("info", "[chunked] init", { rid: req.requestId, uploadId, filename: sanitizedFilename, totalSize, totalChunks });
+  
+  res.json({
+    uploadId,
+    filename: sanitizedFilename,
+    totalChunks,
+    chunkUploadUrl: `/api/upload/${userFolder}/chunked/${uploadId}`
+  });
+});
+
+// 12. Chunked upload - Upload chunk
+app.post("/api/upload/:userFolder/chunked/:uploadId", (req, res) => {
+  const { userFolder, uploadId } = req.params;
+  
+  const uploadMeta = activeChunkedUploads.get(uploadId);
+  if (!uploadMeta || uploadMeta.userFolder !== userFolder) {
+    return res.status(404).json({ error: "Upload session not found" });
+  }
+  
+  const busboy = Busboy({ headers: req.headers });
+  
+  busboy.on("field", (name, value) => {
+    if (name === "chunkIndex") {
+      req.chunkIndex = parseInt(value, 10);
+    }
+  });
+  
+  busboy.on("file", (fieldname, file, info) => {
+    const chunkIndex = req.chunkIndex ?? parseInt(req.query.chunkIndex || "0", 10);
+    const chunkPath = path.join(uploadMeta.tempDir, `chunk_${String(chunkIndex).padStart(6, "0")}`);
+    
+    const writeStream = fs.createWriteStream(chunkPath);
+    file.pipe(writeStream);
+    
+    writeStream.on("finish", () => {
+      uploadMeta.receivedChunks.add(chunkIndex);
+      
+      log("info", "[chunked] chunk received", { 
+        rid: req.requestId, 
+        uploadId, 
+        chunkIndex, 
+        received: uploadMeta.receivedChunks.size,
+        total: uploadMeta.totalChunks
+      });
+      
+      // Check if all chunks received
+      if (uploadMeta.receivedChunks.size === uploadMeta.totalChunks) {
+        // Assemble file
+        assembleChunkedFile(uploadMeta, req.requestId)
+          .then((result) => {
+            activeChunkedUploads.delete(uploadId);
+            res.json(result);
+          })
+          .catch((err) => {
+            log("error", "[chunked] assembly failed", { rid: req.requestId, uploadId, err: String(err) });
+            res.status(500).json({ error: "Failed to assemble file" });
+          });
+      } else {
+        res.json({
+          success: true,
+          chunkIndex,
+          receivedChunks: uploadMeta.receivedChunks.size,
+          totalChunks: uploadMeta.totalChunks,
+          complete: false
+        });
+      }
+    });
+    
+    writeStream.on("error", (err) => {
+      log("error", "[chunked] chunk write error", { rid: req.requestId, uploadId, chunkIndex, err: String(err) });
+      res.status(500).json({ error: "Failed to write chunk" });
+    });
+  });
+  
+  req.pipe(busboy);
+});
+
+// Helper: Assemble chunked file
+async function assembleChunkedFile(meta, rid) {
+  const { uploadId, filename, totalChunks, tempDir, targetPath, userRoot, startTime } = meta;
+  
+  // Ensure target directory exists
+  if (!fs.existsSync(targetPath)) {
+    fs.mkdirSync(targetPath, { recursive: true });
+  }
+  
+  const finalPath = path.join(targetPath, filename);
+  
+  // Verify path safety
+  if (!finalPath.startsWith(userRoot)) {
+    throw new Error("Invalid target path");
+  }
+  
+  log("info", "[chunked] assembling", { rid, uploadId, filename, chunks: totalChunks });
+  
+  const writeStream = fs.createWriteStream(finalPath);
+  
+  for (let i = 0; i < totalChunks; i++) {
+    const chunkPath = path.join(tempDir, `chunk_${String(i).padStart(6, "0")}`);
+    const chunkData = fs.readFileSync(chunkPath);
+    writeStream.write(chunkData);
+  }
+  
+  writeStream.end();
+  
+  // Wait for write to complete
+  await new Promise((resolve, reject) => {
+    writeStream.on("finish", resolve);
+    writeStream.on("error", reject);
+  });
+  
+  // Cleanup temp files
+  try {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  } catch (err) {
+    log("warn", "[chunked] cleanup failed", { rid, tempDir, err: String(err) });
+  }
+  
+  const stats = fs.statSync(finalPath);
+  const totalTime = Date.now() - startTime;
+  const mbps = stats.size > 0 ? ((stats.size / 1024 / 1024) / (totalTime / 1000)).toFixed(2) : 0;
+  
+  log("info", "[chunked] complete", { 
+    rid, 
+    uploadId, 
+    filename, 
+    size: stats.size, 
+    totalTimeMs: totalTime,
+    mbps: `${mbps} MB/s`
+  });
+  
+  const relativePath = path.relative(UPLOADS_ROOT, finalPath).replace(/\\/g, "/");
+  
+  return {
+    success: true,
+    complete: true,
+    filename,
+    size: stats.size,
+    path: relativePath,
+    mediaPath: `vault/Uploads/${relativePath}`,
+    uploadTimeMs: totalTime
+  };
+}
+
+// 13. Chunked upload - Get status
+app.get("/api/upload/:userFolder/chunked/:uploadId", (req, res) => {
+  const { userFolder, uploadId } = req.params;
+  
+  const uploadMeta = activeChunkedUploads.get(uploadId);
+  if (!uploadMeta || uploadMeta.userFolder !== userFolder) {
+    return res.status(404).json({ error: "Upload session not found" });
+  }
+  
+  res.json({
+    uploadId,
+    filename: uploadMeta.filename,
+    totalChunks: uploadMeta.totalChunks,
+    receivedChunks: uploadMeta.receivedChunks.size,
+    missingChunks: Array.from({ length: uploadMeta.totalChunks }, (_, i) => i)
+      .filter(i => !uploadMeta.receivedChunks.has(i)),
+    complete: uploadMeta.receivedChunks.size === uploadMeta.totalChunks
+  });
+});
+
+// 14. Delete a file
+app.delete("/api/files/:userFolder", express.json(), (req, res) => {
+  const { userFolder } = req.params;
+  const filePath = req.query.path || req.body?.path;
+  
+  if (!filePath) {
+    return res.status(400).json({ error: "File path is required" });
+  }
+  
+  const resolved = resolveUploadPath(userFolder, filePath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid user folder or path" });
+  }
+  
+  if (!fs.existsSync(resolved.targetPath)) {
+    return res.status(404).json({ error: "File not found" });
+  }
+  
+  try {
+    const stat = fs.statSync(resolved.targetPath);
+    if (stat.isDirectory()) {
+      return res.status(400).json({ error: "Path is a directory, use DELETE /api/folders/:userFolder" });
+    }
+    
+    fs.unlinkSync(resolved.targetPath);
+    log("info", "[files] deleted", { rid: req.requestId, userFolder, path: resolved.targetPath });
+    res.json({ success: true });
+  } catch (err) {
+    log("error", "[files] delete error", { rid: req.requestId, userFolder, err: String(err) });
+    res.status(500).json({ error: "Failed to delete file" });
+  }
+});
+
 // Central error handler (last middleware)
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
@@ -626,6 +1219,8 @@ app.listen(PORT, HOST, () => {
     cwd: process.cwd(),
     mediaRoots: MEDIA_ROOTS,
     folders: FOLDERS,
+    userFolders: USER_FOLDERS,
+    uploadsRoot: UPLOADS_ROOT,
     thumbCache: THUMB_CACHE,
     videoChunkSize: VIDEO_CHUNK_SIZE,
     logging: {
@@ -645,4 +1240,5 @@ app.listen(PORT, HOST, () => {
   for (const u of urls) console.log(`- ${u}`);
   log("info", "- Health:", { url: `${urls[0]}/healthz` });
   log("info", "- Media API:", { url: `${urls[0]}/api/media` });
+  log("info", "- Upload API:", { url: `${urls[0]}/api/upload/:userFolder` });
 });

@@ -10,6 +10,7 @@ const path = require("path");
 const sharp = require("sharp"); // npm install sharp
 const mime = require("mime");   // npm install mime
 const cors = require("cors");
+const multer = require("multer"); // npm install multer
 
 // Optional .env support (safe if dependency isn't installed yet)
 try {
@@ -130,10 +131,13 @@ const MEDIA_ROOTS_RAW =
   process.env.ROOT_DIR ||
   DEFAULT_ROOT;
 
-const FOLDERS = (process.env.MEDIA_FOLDERS || "Photos,Videos,Movies,TVShows,Documents")
+const FOLDERS = (process.env.MEDIA_FOLDERS || "Photos,Videos,Movies,TVShows,Documents,Uploads")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+
+// Default family member folders for Uploads
+const FAMILY_MEMBERS = ["John", "David", "Max", "Juliette", "Tomas", "Camille"];
 
 // Max chunk size for video streaming (default 1MB)
 const VIDEO_CHUNK_SIZE = Number.parseInt(
@@ -241,6 +245,104 @@ const THUMB_CACHE = ensureWritableDir(
   process.env.THUMB_CACHE_DIR || DEFAULT_THUMB_CACHE_DIR,
   path.join(os.tmpdir(), "mediaserver-thumbcache")
 );
+
+// === UPLOAD CONFIGURATION ===
+// Max file size for uploads (default 500MB)
+const MAX_UPLOAD_SIZE = Number.parseInt(
+  process.env.MAX_UPLOAD_SIZE || String(500 * 1024 * 1024),
+  10
+);
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    // Default to first media root's Uploads folder
+    const uploadRoot = MEDIA_ROOTS[0]?.abs;
+    if (!uploadRoot) {
+      return cb(new Error("No media root configured"));
+    }
+    
+    // Get target folder from request body or query
+    const targetFolder = req.body?.folder || req.query?.folder || "Uploads";
+    const destPath = path.join(uploadRoot, targetFolder);
+    
+    // Ensure destination exists
+    try {
+      if (!fs.existsSync(destPath)) {
+        fs.mkdirSync(destPath, { recursive: true });
+      }
+      cb(null, destPath);
+    } catch (err) {
+      cb(err);
+    }
+  },
+  filename: (req, file, cb) => {
+    // Keep original filename, but sanitize it
+    const sanitized = file.originalname
+      .replace(/[^a-zA-Z0-9._-]/g, "_")
+      .replace(/_+/g, "_");
+    
+    // Add timestamp to avoid overwrites
+    const ext = path.extname(sanitized);
+    const base = path.basename(sanitized, ext);
+    const timestamp = Date.now();
+    cb(null, `${base}_${timestamp}${ext}`);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: MAX_UPLOAD_SIZE },
+  fileFilter: (req, file, cb) => {
+    // Allow images and videos
+    const allowedMimes = [
+      "image/jpeg", "image/png", "image/gif", "image/webp",
+      "video/mp4", "video/quicktime", "video/x-msvideo", "video/x-matroska",
+      "application/pdf", "application/msword",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ];
+    if (allowedMimes.includes(file.mimetype) || ALLOWED_EXTS.includes(path.extname(file.originalname).toLowerCase())) {
+      cb(null, true);
+    } else {
+      cb(new Error(`File type not allowed: ${file.mimetype}`));
+    }
+  },
+});
+
+// Create default family member folders on startup
+function createFamilyFolders() {
+  const primaryRoot = MEDIA_ROOTS[0]?.abs;
+  if (!primaryRoot) {
+    log("warn", "[startup] No media root configured, skipping family folder creation");
+    return;
+  }
+  
+  const uploadsPath = path.join(primaryRoot, "Uploads");
+  
+  // Create Uploads folder if it doesn't exist
+  if (!fs.existsSync(uploadsPath)) {
+    try {
+      fs.mkdirSync(uploadsPath, { recursive: true });
+      log("info", "[startup] Created Uploads folder", { path: uploadsPath });
+    } catch (err) {
+      log("error", "[startup] Failed to create Uploads folder", { path: uploadsPath, err: String(err) });
+      return;
+    }
+  }
+  
+  // Create family member subfolders
+  for (const member of FAMILY_MEMBERS) {
+    const memberPath = path.join(uploadsPath, member);
+    if (!fs.existsSync(memberPath)) {
+      try {
+        fs.mkdirSync(memberPath, { recursive: true });
+        log("info", "[startup] Created family folder", { member, path: memberPath });
+      } catch (err) {
+        log("warn", "[startup] Failed to create family folder", { member, path: memberPath, err: String(err) });
+      }
+    }
+  }
+}
 
 function resolveVirtualMediaPath(virtualPath) {
   const normalized = String(virtualPath || "")
@@ -602,6 +704,190 @@ app.get("/media/*", (req, res) => {
   }
 });
 
+// === UPLOAD & FOLDER MANAGEMENT ENDPOINTS ===
+
+// Parse JSON bodies for folder creation
+app.use(express.json());
+
+// 6. List available folders (for upload destination selection)
+app.get("/api/folders", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const primaryRoot = MEDIA_ROOTS[0]?.abs;
+  if (!primaryRoot) {
+    return res.status(500).json({ error: "No media root configured" });
+  }
+  
+  const folders = [];
+  
+  // Scan top-level folders
+  for (const folder of FOLDERS) {
+    const folderPath = path.join(primaryRoot, folder);
+    if (fs.existsSync(folderPath)) {
+      folders.push({
+        name: folder,
+        path: folder,
+        isFamily: false,
+      });
+      
+      // If this is Uploads, also list subfolders (family members)
+      if (folder === "Uploads") {
+        try {
+          const subfolders = fs.readdirSync(folderPath);
+          for (const sub of subfolders) {
+            const subPath = path.join(folderPath, sub);
+            if (fs.statSync(subPath).isDirectory() && !sub.startsWith(".")) {
+              folders.push({
+                name: sub,
+                path: `Uploads/${sub}`,
+                isFamily: FAMILY_MEMBERS.includes(sub),
+              });
+            }
+          }
+        } catch (err) {
+          log("warn", "[api/folders] Error scanning Uploads subfolders", { err: String(err) });
+        }
+      }
+    }
+  }
+  
+  res.json({
+    folders,
+    familyMembers: FAMILY_MEMBERS,
+    root: MEDIA_ROOTS[0]?.id,
+  });
+});
+
+// 7. Create a new folder
+app.post("/api/folder", (req, res) => {
+  const { folderName, parentFolder } = req.body;
+  
+  if (!folderName) {
+    return res.status(400).json({ error: "folderName is required" });
+  }
+  
+  // Sanitize folder name
+  const sanitizedName = String(folderName)
+    .trim()
+    .replace(/[^a-zA-Z0-9_-\s]/g, "")
+    .replace(/\s+/g, "_");
+  
+  if (!sanitizedName) {
+    return res.status(400).json({ error: "Invalid folder name after sanitization" });
+  }
+  
+  const primaryRoot = MEDIA_ROOTS[0]?.abs;
+  if (!primaryRoot) {
+    return res.status(500).json({ error: "No media root configured" });
+  }
+  
+  // Default parent is Uploads
+  const parent = parentFolder || "Uploads";
+  const newFolderPath = path.join(primaryRoot, parent, sanitizedName);
+  
+  // Security: ensure we're still within the media root
+  const rootPrefix = primaryRoot.endsWith(path.sep) ? primaryRoot : `${primaryRoot}${path.sep}`;
+  if (!newFolderPath.startsWith(rootPrefix) && newFolderPath !== primaryRoot) {
+    log("warn", "[api/folder] Path traversal attempt blocked", { rid: req.requestId, newFolderPath, primaryRoot });
+    return res.status(400).json({ error: "Invalid folder path" });
+  }
+  
+  if (fs.existsSync(newFolderPath)) {
+    return res.status(409).json({ error: "Folder already exists", path: `${parent}/${sanitizedName}` });
+  }
+  
+  try {
+    fs.mkdirSync(newFolderPath, { recursive: true });
+    log("info", "[api/folder] Created folder", { rid: req.requestId, path: newFolderPath });
+    res.status(201).json({
+      success: true,
+      message: "Folder created successfully",
+      folder: {
+        name: sanitizedName,
+        path: `${parent}/${sanitizedName}`,
+      },
+    });
+  } catch (err) {
+    log("error", "[api/folder] Failed to create folder", { rid: req.requestId, path: newFolderPath, err: String(err) });
+    res.status(500).json({ error: "Failed to create folder", details: String(err) });
+  }
+});
+
+// 8. Upload file(s)
+app.post("/api/upload", (req, res) => {
+  // Use multer to handle the upload
+  upload.array("files", 20)(req, res, (err) => {
+    if (err) {
+      log("error", "[api/upload] Upload error", { rid: req.requestId, err: String(err) });
+      if (err.code === "LIMIT_FILE_SIZE") {
+        return res.status(413).json({ error: "File too large", maxSize: MAX_UPLOAD_SIZE });
+      }
+      return res.status(400).json({ error: String(err.message || err) });
+    }
+    
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: "No files uploaded" });
+    }
+    
+    const uploaded = req.files.map((file) => {
+      const relativePath = path.relative(MEDIA_ROOTS[0].abs, file.path).replace(/\\/g, "/");
+      return {
+        originalName: file.originalname,
+        savedAs: file.filename,
+        size: file.size,
+        mimetype: file.mimetype,
+        path: `${MEDIA_ROOTS[0].id}/${relativePath}`,
+        viewUrl: `/view/${MEDIA_ROOTS[0].id}/${relativePath}`,
+        thumbUrl: `/thumb/${MEDIA_ROOTS[0].id}/${relativePath}`,
+      };
+    });
+    
+    log("info", "[api/upload] Files uploaded", {
+      rid: req.requestId,
+      count: uploaded.length,
+      folder: req.body?.folder || req.query?.folder || "Uploads",
+      files: uploaded.map((f) => f.savedAs),
+    });
+    
+    res.status(201).json({
+      success: true,
+      message: `${uploaded.length} file(s) uploaded successfully`,
+      files: uploaded,
+    });
+  });
+});
+
+// 9. Delete a file (optional - for managing uploads)
+app.delete("/api/file", (req, res) => {
+  const { filePath } = req.body;
+  
+  if (!filePath) {
+    return res.status(400).json({ error: "filePath is required" });
+  }
+  
+  const resolved = resolveVirtualMediaPath(filePath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid file path" });
+  }
+  
+  // Only allow deletion from Uploads folder for safety
+  if (!resolved.virtualKey.includes("Uploads/")) {
+    return res.status(403).json({ error: "Can only delete files from Uploads folder" });
+  }
+  
+  if (!fs.existsSync(resolved.absPath)) {
+    return res.status(404).json({ error: "File not found" });
+  }
+  
+  try {
+    fs.unlinkSync(resolved.absPath);
+    log("info", "[api/file] File deleted", { rid: req.requestId, path: resolved.absPath });
+    res.json({ success: true, message: "File deleted successfully" });
+  } catch (err) {
+    log("error", "[api/file] Failed to delete file", { rid: req.requestId, path: resolved.absPath, err: String(err) });
+    res.status(500).json({ error: "Failed to delete file", details: String(err) });
+  }
+});
+
 // Central error handler (last middleware)
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
@@ -631,6 +917,9 @@ function getLanUrls({ host, port }) {
   urls.unshift(`http://${host}:${port}`);
   return Array.from(new Set(urls));
 }
+
+// Create family folders before starting server
+createFamilyFolders();
 
 app.listen(PORT, HOST, () => {
   const urls = getLanUrls({ host: HOST, port: PORT });

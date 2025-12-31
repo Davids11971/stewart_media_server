@@ -19,7 +19,12 @@ app.set("etag", false);
 // === LOGGING / DEBUG ===
 const LOG_LEVEL = "info";
 const LOG_REQUESTS = true;
+const LOG_REQUEST_HEADERS = false;
+const LOG_RESPONSE_HEADERS = false;
 const LOG_SCAN = true;      // Keep this true to see file detection logs
+const LOG_RESOLVE = false;
+const LOG_CORS = false;
+const LOG_STREAM = false;
 const LOG_THUMBS = true;    // Useful for checking if sharp is working
 const DEBUG_ENDPOINTS = false;
 const REQUEST_TIMEOUT_MS = 0; // 0 = disabled

@@ -22,6 +22,7 @@ const LOG_REQUESTS = true;
 const LOG_SCAN = true;      // Keep this true to see file detection logs
 const LOG_THUMBS = true;    // Useful for checking if sharp is working
 const DEBUG_ENDPOINTS = false;
+const REQUEST_TIMEOUT_MS = 0; // 0 = disabled
 
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3, trace: 4 };
 function shouldLog(level) {

@@ -1,5 +1,0 @@
-# Deprecated: use mediaserver@.service instead.
-#
-# This file is kept only for backward compatibility with older installs that
-# referenced it directly. For new installs, run:
-#   ./scripts/install-systemd.sh

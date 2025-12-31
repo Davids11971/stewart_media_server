@@ -11,31 +11,17 @@ const sharp = require("sharp"); // npm install sharp
 const mime = require("mime");   // npm install mime
 const cors = require("cors");
 
-// Optional .env support (safe if dependency isn't installed yet)
-try {
-  // eslint-disable-next-line global-require
-  require("dotenv").config();
-} catch {}
 
 const app = express();
 // Avoid conditional GET 304s on JSON endpoints (some clients/fetch flows expect a body every time)
 app.set("etag", false);
-const PORT = Number.parseInt(process.env.PORT || "4000", 10);
-const HOST = process.env.HOST || "0.0.0.0";
 
 // === LOGGING / DEBUG ===
-// Turn these on/off via env vars (good for Raspberry Pi systemd)
-const LOG_LEVEL = String(process.env.LOG_LEVEL || "info").toLowerCase(); // error|warn|info|debug|trace
-const LOG_REQUESTS = String(process.env.LOG_REQUESTS || "1") === "1";
-const LOG_REQUEST_HEADERS = String(process.env.LOG_REQUEST_HEADERS || "0") === "1";
-const LOG_RESPONSE_HEADERS = String(process.env.LOG_RESPONSE_HEADERS || "0") === "1";
-const LOG_SCAN = String(process.env.LOG_SCAN || "0") === "1";
-const LOG_RESOLVE = String(process.env.LOG_RESOLVE || "0") === "1";
-const LOG_CORS = String(process.env.LOG_CORS || "0") === "1";
-const LOG_STREAM = String(process.env.LOG_STREAM || "0") === "1";
-const LOG_THUMBS = String(process.env.LOG_THUMBS || "0") === "1";
-const DEBUG_ENDPOINTS = String(process.env.DEBUG_ENDPOINTS || "0") === "1";
-const REQUEST_TIMEOUT_MS = Number.parseInt(process.env.REQUEST_TIMEOUT_MS || "0", 10); // 0 = disabled
+const LOG_LEVEL = "info";
+const LOG_REQUESTS = true;
+const LOG_SCAN = true;      // Keep this true to see file detection logs
+const LOG_THUMBS = true;    // Useful for checking if sharp is working
+const DEBUG_ENDPOINTS = false;
 
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3, trace: 4 };
 function shouldLog(level) {
@@ -118,35 +104,45 @@ app.use((req, res, next) => {
   next();
 });
 
-// === CONFIG ===
-// On Raspberry Pi / Linux this is typically something like: /media/<user>/<driveLabel>
-// On Windows you might use something like: G:/ or D:/Media
-const DEFAULT_ROOT =
-  process.platform === "win32" ? "G:/" : "/media/davids11971/VAULT";
+// === HARDCODED CONFIG ===
 
-const MEDIA_ROOTS_RAW =
-  process.env.MEDIA_ROOTS ||
-  process.env.MEDIA_ROOT ||
-  process.env.ROOT_DIR ||
-  DEFAULT_ROOT;
+const PORT = 4000;
 
-const FOLDERS = (process.env.MEDIA_FOLDERS || "Photos,Videos,Movies,TVShows,Documents")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const HOST = "0.0.0.0";
 
-// Max chunk size for video streaming (default 1MB)
-const VIDEO_CHUNK_SIZE = Number.parseInt(
-  process.env.VIDEO_CHUNK_SIZE || String(1 * 1024 * 1024),
-  10
-);
+
+
+// Automatically choose the path based on the Operating System
+
+const MEDIA_ROOT = process.platform === "win32"
+
+  ? "G:/"                            // Your Windows Drive
+
+  : "/media/davids11971/VAULT";      // Your Raspberry Pi Drive
+
+
+
+const FOLDERS = ["Photos", "Videos", "Movies", "TVShows", "Documents"];
+
+const VIDEO_CHUNK_SIZE = 1024 * 1024; // 1MB
+
+const ALLOWED_EXTS = [".mp4", ".mov", ".avi", ".mkv", ".jpg", ".jpeg", ".png", ".gif", ".webp"];
+
+
+
+// Force MEDIA_ROOTS to use the hardcoded MEDIA_ROOT
+
+const MEDIA_ROOTS = [{
+
+  id: "vault",
+
+  rootPath: MEDIA_ROOT,
+
+  abs: path.resolve(MEDIA_ROOT)
+
+}];
 
 // THUMB_CACHE is configured after MEDIA_ROOTS is computed (so we can default it under the VAULT root).
-
-const ALLOWED_EXTS = [
-  ".mp4", ".mov", ".avi", ".mkv", 
-  ".jpg", ".jpeg", ".png", ".gif", ".webp"
-];
 
 app.use(
   cors({
@@ -185,25 +181,6 @@ function slugifyId(s) {
     .replace(/^-|-$/g, "");
   return cleaned || "root";
 }
-
-const MEDIA_ROOTS = (() => {
-  const roots = parseRoots(MEDIA_ROOTS_RAW);
-  const used = new Set();
-
-  return roots.map((rootPath, idx) => {
-    const base = slugifyId(path.basename(rootPath) || `root${idx}`);
-    let id = base;
-    let n = 2;
-    while (used.has(id)) {
-      id = `${base}-${n}`;
-      n += 1;
-    }
-    used.add(id);
-
-    const abs = path.resolve(rootPath);
-    return { id, rootPath, abs };
-  });
-})();
 
 function ensureWritableDir(preferredPath, fallbackPath) {
   const prefer = path.resolve(preferredPath);

@@ -628,6 +628,28 @@ function isValidUserFolder(userFolder) {
   return USER_FOLDERS.includes(userFolder);
 }
 
+// Helper: Validate main section
+function isValidSection(section) {
+  return FOLDERS.includes(section);
+}
+
+// Helper: Resolve section path safely (prevent traversal)
+function resolveSectionPath(section, subPath = "") {
+  if (!isValidSection(section)) return null;
+  
+  const sectionRoot = path.join(MEDIA_ROOTS[0].abs, section);
+  const targetPath = subPath 
+    ? path.resolve(sectionRoot, subPath.replace(/\\/g, "/").replace(/^\/+/, ""))
+    : sectionRoot;
+  
+  // Prevent path traversal
+  if (!targetPath.startsWith(sectionRoot)) {
+    return null;
+  }
+  
+  return { sectionRoot, targetPath };
+}
+
 // Helper: Sanitize filename (remove dangerous characters)
 function sanitizeFilename(filename) {
   return String(filename || "file")
@@ -1144,7 +1166,531 @@ app.get("/api/upload/:userFolder/chunked/:uploadId", (req, res) => {
   });
 });
 
-// 14. Delete a file
+// =====================================================
+// === SECTION (GLOBAL) UPLOAD API ===
+// =====================================================
+
+// 14. Get available sections for upload
+app.get("/api/sections", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    sections: FOLDERS,
+    description: "Main media sections available for upload"
+  });
+});
+
+// 15. List contents of a section (with optional subpath)
+app.get("/api/sections/:section", (req, res) => {
+  const { section } = req.params;
+  const subPath = req.query.path || "";
+  
+  const resolved = resolveSectionPath(section, subPath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid section or path" });
+  }
+  
+  const { targetPath, sectionRoot } = resolved;
+  
+  if (!fs.existsSync(targetPath)) {
+    return res.status(404).json({ error: "Path not found" });
+  }
+  
+  try {
+    const stat = fs.statSync(targetPath);
+    if (!stat.isDirectory()) {
+      return res.status(400).json({ error: "Path is not a directory" });
+    }
+    
+    const entries = fs.readdirSync(targetPath, { withFileTypes: true });
+    const items = entries
+      .filter(e => !e.name.startsWith(".") && !e.name.startsWith("$"))
+      .map(e => {
+        const fullPath = path.join(targetPath, e.name);
+        const stats = fs.statSync(fullPath);
+        const relativePath = path.relative(sectionRoot, fullPath).replace(/\\/g, "/");
+        const ext = path.extname(e.name).toLowerCase();
+        
+        return {
+          name: e.name,
+          type: e.isDirectory() ? "folder" : "file",
+          mediaType: e.isFile() ? (isVideo(e.name) ? "video" : "image") : null,
+          size: e.isDirectory() ? null : stats.size,
+          modified: stats.mtimeMs,
+          path: relativePath || e.name,
+          // For media files, include the virtual path for streaming/viewing
+          mediaPath: e.isFile() && ALLOWED_EXTS.includes(ext) ? `vault/${section}/${relativePath || e.name}` : null
+        };
+      });
+    
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      section,
+      currentPath: subPath || "/",
+      items
+    });
+  } catch (err) {
+    log("error", "[sections] list error", { rid: req.requestId, section, subPath, err: String(err) });
+    res.status(500).json({ error: "Failed to list section" });
+  }
+});
+
+// 16. Create a folder within a section (e.g., new TV show folder)
+app.post("/api/sections/:section/folder", express.json(), (req, res) => {
+  const { section } = req.params;
+  const { name, path: subPath = "" } = req.body;
+  
+  if (!name) {
+    return res.status(400).json({ error: "Folder name is required" });
+  }
+  
+  const sanitizedName = sanitizeFolderName(name);
+  if (!sanitizedName) {
+    return res.status(400).json({ error: "Invalid folder name" });
+  }
+  
+  const resolved = resolveSectionPath(section, subPath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid section or path" });
+  }
+  
+  const newFolderPath = path.join(resolved.targetPath, sanitizedName);
+  
+  // Verify still within section root
+  if (!newFolderPath.startsWith(resolved.sectionRoot)) {
+    return res.status(400).json({ error: "Invalid path" });
+  }
+  
+  if (fs.existsSync(newFolderPath)) {
+    return res.status(409).json({ error: "Folder already exists" });
+  }
+  
+  try {
+    fs.mkdirSync(newFolderPath, { recursive: true });
+    log("info", "[sections] folder created", { rid: req.requestId, section, path: newFolderPath });
+    
+    const relativePath = path.relative(resolved.sectionRoot, newFolderPath).replace(/\\/g, "/");
+    res.status(201).json({
+      success: true,
+      name: sanitizedName,
+      path: relativePath,
+      section
+    });
+  } catch (err) {
+    log("error", "[sections] folder create error", { rid: req.requestId, section, err: String(err) });
+    res.status(500).json({ error: "Failed to create folder" });
+  }
+});
+
+// 17. Upload file(s) to a section - Streaming upload (no size limits)
+app.post("/api/upload/section/:section", (req, res) => {
+  const { section } = req.params;
+  const subPath = req.query.path || "";
+  
+  const resolved = resolveSectionPath(section, subPath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid section or path" });
+  }
+  
+  // Ensure target directory exists
+  if (!fs.existsSync(resolved.targetPath)) {
+    try {
+      fs.mkdirSync(resolved.targetPath, { recursive: true });
+    } catch (err) {
+      return res.status(500).json({ error: "Failed to create target directory" });
+    }
+  }
+  
+  const busboy = Busboy({ 
+    headers: req.headers,
+    limits: {
+      fileSize: Infinity,
+      files: 100
+    }
+  });
+  
+  const uploadedFiles = [];
+  const errors = [];
+  let fileCount = 0;
+  
+  busboy.on("file", (fieldname, file, info) => {
+    const { filename, encoding, mimeType } = info;
+    const sanitizedFilename = sanitizeFilename(filename);
+    const savePath = path.join(resolved.targetPath, sanitizedFilename);
+    
+    // Verify still within section root
+    if (!savePath.startsWith(resolved.sectionRoot)) {
+      errors.push({ filename, error: "Invalid path" });
+      file.resume();
+      return;
+    }
+    
+    fileCount++;
+    const fileIndex = fileCount;
+    const startTime = process.hrtime.bigint();
+    let bytesWritten = 0;
+    
+    log("info", "[section-upload] starting", { 
+      rid: req.requestId, 
+      section, 
+      subPath,
+      filename: sanitizedFilename, 
+      mimeType,
+      fileIndex
+    });
+    
+    const writeStream = fs.createWriteStream(savePath);
+    
+    file.on("data", (chunk) => {
+      bytesWritten += chunk.length;
+    });
+    
+    file.pipe(writeStream);
+    
+    writeStream.on("finish", () => {
+      const ms = hrMs(startTime);
+      const mbps = bytesWritten > 0 ? ((bytesWritten / 1024 / 1024) / (ms / 1000)).toFixed(2) : 0;
+      
+      log("info", "[section-upload] complete", { 
+        rid: req.requestId, 
+        section,
+        filename: sanitizedFilename, 
+        bytes: bytesWritten,
+        ms,
+        mbps: `${mbps} MB/s`
+      });
+      
+      const relativePath = path.relative(resolved.sectionRoot, savePath).replace(/\\/g, "/");
+      uploadedFiles.push({
+        filename: sanitizedFilename,
+        originalName: filename,
+        size: bytesWritten,
+        path: relativePath,
+        mediaPath: `vault/${section}/${relativePath}`,
+        mimeType,
+        uploadTimeMs: ms
+      });
+    });
+    
+    writeStream.on("error", (err) => {
+      log("error", "[section-upload] write error", { rid: req.requestId, filename: sanitizedFilename, err: String(err) });
+      errors.push({ filename: sanitizedFilename, error: String(err) });
+    });
+    
+    file.on("error", (err) => {
+      log("error", "[section-upload] stream error", { rid: req.requestId, filename: sanitizedFilename, err: String(err) });
+      errors.push({ filename: sanitizedFilename, error: String(err) });
+    });
+  });
+  
+  busboy.on("finish", () => {
+    setTimeout(() => {
+      if (errors.length > 0 && uploadedFiles.length === 0) {
+        res.status(500).json({ error: "Upload failed", errors });
+      } else {
+        res.json({
+          success: true,
+          section,
+          uploaded: uploadedFiles,
+          errors: errors.length > 0 ? errors : undefined
+        });
+      }
+    }, 100);
+  });
+  
+  busboy.on("error", (err) => {
+    log("error", "[section-upload] busboy error", { rid: req.requestId, err: String(err) });
+    res.status(500).json({ error: "Upload processing failed" });
+  });
+  
+  req.pipe(busboy);
+});
+
+// 18. Chunked upload to section - Initialize
+const activeSectionChunkedUploads = new Map();
+
+app.post("/api/upload/section/:section/chunked/init", express.json(), (req, res) => {
+  const { section } = req.params;
+  const { filename, totalSize, totalChunks, path: subPath = "" } = req.body;
+  
+  if (!filename || !totalSize || !totalChunks) {
+    return res.status(400).json({ error: "Missing required fields: filename, totalSize, totalChunks" });
+  }
+  
+  const resolved = resolveSectionPath(section, subPath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid section or path" });
+  }
+  
+  const sanitizedFilename = sanitizeFilename(filename);
+  const uploadId = `section-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const tempDir = path.join(os.tmpdir(), "mediaserver-section-chunks", uploadId);
+  
+  try {
+    fs.mkdirSync(tempDir, { recursive: true });
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to create temp directory" });
+  }
+  
+  const uploadMeta = {
+    uploadId,
+    section,
+    subPath,
+    filename: sanitizedFilename,
+    originalName: filename,
+    totalSize,
+    totalChunks,
+    receivedChunks: new Set(),
+    tempDir,
+    targetPath: resolved.targetPath,
+    sectionRoot: resolved.sectionRoot,
+    startTime: Date.now()
+  };
+  
+  activeSectionChunkedUploads.set(uploadId, uploadMeta);
+  
+  log("info", "[section-chunked] init", { rid: req.requestId, uploadId, section, filename: sanitizedFilename, totalSize, totalChunks });
+  
+  res.json({
+    uploadId,
+    filename: sanitizedFilename,
+    totalChunks,
+    chunkUploadUrl: `/api/upload/section/${section}/chunked/${uploadId}`
+  });
+});
+
+// 19. Chunked upload to section - Upload chunk
+app.post("/api/upload/section/:section/chunked/:uploadId", (req, res) => {
+  const { section, uploadId } = req.params;
+  
+  const uploadMeta = activeSectionChunkedUploads.get(uploadId);
+  if (!uploadMeta || uploadMeta.section !== section) {
+    return res.status(404).json({ error: "Upload session not found" });
+  }
+  
+  const busboy = Busboy({ headers: req.headers });
+  
+  busboy.on("field", (name, value) => {
+    if (name === "chunkIndex") {
+      req.chunkIndex = parseInt(value, 10);
+    }
+  });
+  
+  busboy.on("file", (fieldname, file, info) => {
+    const chunkIndex = req.chunkIndex ?? parseInt(req.query.chunkIndex || "0", 10);
+    const chunkPath = path.join(uploadMeta.tempDir, `chunk_${String(chunkIndex).padStart(6, "0")}`);
+    
+    const writeStream = fs.createWriteStream(chunkPath);
+    file.pipe(writeStream);
+    
+    writeStream.on("finish", () => {
+      uploadMeta.receivedChunks.add(chunkIndex);
+      
+      log("info", "[section-chunked] chunk received", { 
+        rid: req.requestId, 
+        uploadId, 
+        section,
+        chunkIndex, 
+        received: uploadMeta.receivedChunks.size,
+        total: uploadMeta.totalChunks
+      });
+      
+      if (uploadMeta.receivedChunks.size === uploadMeta.totalChunks) {
+        assembleSectionChunkedFile(uploadMeta, req.requestId)
+          .then((result) => {
+            activeSectionChunkedUploads.delete(uploadId);
+            res.json(result);
+          })
+          .catch((err) => {
+            log("error", "[section-chunked] assembly failed", { rid: req.requestId, uploadId, err: String(err) });
+            res.status(500).json({ error: "Failed to assemble file" });
+          });
+      } else {
+        res.json({
+          success: true,
+          chunkIndex,
+          receivedChunks: uploadMeta.receivedChunks.size,
+          totalChunks: uploadMeta.totalChunks,
+          complete: false
+        });
+      }
+    });
+    
+    writeStream.on("error", (err) => {
+      log("error", "[section-chunked] chunk write error", { rid: req.requestId, uploadId, chunkIndex, err: String(err) });
+      res.status(500).json({ error: "Failed to write chunk" });
+    });
+  });
+  
+  req.pipe(busboy);
+});
+
+// Helper: Assemble section chunked file
+async function assembleSectionChunkedFile(meta, rid) {
+  const { uploadId, section, filename, totalChunks, tempDir, targetPath, sectionRoot, startTime } = meta;
+  
+  if (!fs.existsSync(targetPath)) {
+    fs.mkdirSync(targetPath, { recursive: true });
+  }
+  
+  const finalPath = path.join(targetPath, filename);
+  
+  if (!finalPath.startsWith(sectionRoot)) {
+    throw new Error("Invalid target path");
+  }
+  
+  log("info", "[section-chunked] assembling", { rid, uploadId, section, filename, chunks: totalChunks });
+  
+  const writeStream = fs.createWriteStream(finalPath);
+  
+  for (let i = 0; i < totalChunks; i++) {
+    const chunkPath = path.join(tempDir, `chunk_${String(i).padStart(6, "0")}`);
+    const chunkData = fs.readFileSync(chunkPath);
+    writeStream.write(chunkData);
+  }
+  
+  writeStream.end();
+  
+  await new Promise((resolve, reject) => {
+    writeStream.on("finish", resolve);
+    writeStream.on("error", reject);
+  });
+  
+  try {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  } catch (err) {
+    log("warn", "[section-chunked] cleanup failed", { rid, tempDir, err: String(err) });
+  }
+  
+  const stats = fs.statSync(finalPath);
+  const totalTime = Date.now() - startTime;
+  const mbps = stats.size > 0 ? ((stats.size / 1024 / 1024) / (totalTime / 1000)).toFixed(2) : 0;
+  
+  log("info", "[section-chunked] complete", { 
+    rid, 
+    uploadId, 
+    section,
+    filename, 
+    size: stats.size, 
+    totalTimeMs: totalTime,
+    mbps: `${mbps} MB/s`
+  });
+  
+  const relativePath = path.relative(sectionRoot, finalPath).replace(/\\/g, "/");
+  
+  return {
+    success: true,
+    complete: true,
+    section,
+    filename,
+    size: stats.size,
+    path: relativePath,
+    mediaPath: `vault/${section}/${relativePath}`,
+    uploadTimeMs: totalTime
+  };
+}
+
+// 20. Chunked upload to section - Get status
+app.get("/api/upload/section/:section/chunked/:uploadId", (req, res) => {
+  const { section, uploadId } = req.params;
+  
+  const uploadMeta = activeSectionChunkedUploads.get(uploadId);
+  if (!uploadMeta || uploadMeta.section !== section) {
+    return res.status(404).json({ error: "Upload session not found" });
+  }
+  
+  res.json({
+    uploadId,
+    section,
+    filename: uploadMeta.filename,
+    totalChunks: uploadMeta.totalChunks,
+    receivedChunks: uploadMeta.receivedChunks.size,
+    missingChunks: Array.from({ length: uploadMeta.totalChunks }, (_, i) => i)
+      .filter(i => !uploadMeta.receivedChunks.has(i)),
+    complete: uploadMeta.receivedChunks.size === uploadMeta.totalChunks
+  });
+});
+
+// 21. Delete a file from a section
+app.delete("/api/sections/:section/file", express.json(), (req, res) => {
+  const { section } = req.params;
+  const filePath = req.query.path || req.body?.path;
+  
+  if (!filePath) {
+    return res.status(400).json({ error: "File path is required" });
+  }
+  
+  const resolved = resolveSectionPath(section, filePath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid section or path" });
+  }
+  
+  if (!fs.existsSync(resolved.targetPath)) {
+    return res.status(404).json({ error: "File not found" });
+  }
+  
+  try {
+    const stat = fs.statSync(resolved.targetPath);
+    if (stat.isDirectory()) {
+      return res.status(400).json({ error: "Path is a directory" });
+    }
+    
+    fs.unlinkSync(resolved.targetPath);
+    log("info", "[sections] file deleted", { rid: req.requestId, section, path: resolved.targetPath });
+    res.json({ success: true });
+  } catch (err) {
+    log("error", "[sections] file delete error", { rid: req.requestId, section, err: String(err) });
+    res.status(500).json({ error: "Failed to delete file" });
+  }
+});
+
+// 22. Delete a folder from a section (must be empty)
+app.delete("/api/sections/:section/folder", express.json(), (req, res) => {
+  const { section } = req.params;
+  const folderPath = req.query.path || req.body?.path;
+  
+  if (!folderPath) {
+    return res.status(400).json({ error: "Folder path is required" });
+  }
+  
+  const resolved = resolveSectionPath(section, folderPath);
+  if (!resolved) {
+    return res.status(400).json({ error: "Invalid section or path" });
+  }
+  
+  // Prevent deleting section root
+  if (resolved.targetPath === resolved.sectionRoot) {
+    return res.status(400).json({ error: "Cannot delete section root folder" });
+  }
+  
+  if (!fs.existsSync(resolved.targetPath)) {
+    return res.status(404).json({ error: "Folder not found" });
+  }
+  
+  try {
+    const stat = fs.statSync(resolved.targetPath);
+    if (!stat.isDirectory()) {
+      return res.status(400).json({ error: "Path is not a directory" });
+    }
+    
+    const contents = fs.readdirSync(resolved.targetPath);
+    if (contents.length > 0) {
+      return res.status(400).json({ error: "Folder is not empty" });
+    }
+    
+    fs.rmdirSync(resolved.targetPath);
+    log("info", "[sections] folder deleted", { rid: req.requestId, section, path: resolved.targetPath });
+    res.json({ success: true });
+  } catch (err) {
+    log("error", "[sections] folder delete error", { rid: req.requestId, section, err: String(err) });
+    res.status(500).json({ error: "Failed to delete folder" });
+  }
+});
+
+// =====================================================
+// === USER FILE MANAGEMENT ===
+// =====================================================
+
+// 23. Delete a file (user uploads)
 app.delete("/api/files/:userFolder", express.json(), (req, res) => {
   const { userFolder } = req.params;
   const filePath = req.query.path || req.body?.path;
